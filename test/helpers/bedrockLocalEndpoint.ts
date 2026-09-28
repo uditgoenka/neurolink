@@ -170,6 +170,11 @@ export async function startLocalBedrock(
           );
           res.write(streamEvent("contentBlockStop", { contentBlockIndex: 0 }));
           res.write(streamEvent("messageStop", { stopReason: "tool_use" }));
+          res.write(
+            streamEvent("metadata", {
+              usage: { inputTokens: 5, outputTokens: 1, totalTokens: 6 },
+            }),
+          );
           res.end();
           return;
         }
@@ -182,6 +187,15 @@ export async function startLocalBedrock(
         );
         res.write(streamEvent("contentBlockStop", { contentBlockIndex: 0 }));
         res.write(streamEvent("messageStop", { stopReason: "end_turn" }));
+        // Real ConverseStream ends with a `metadata` event carrying usage —
+        // without it, a caller (or test) that checks the turn's reported
+        // token usage on the streaming path sees zeros no matter what
+        // actually happened.
+        res.write(
+          streamEvent("metadata", {
+            usage: { inputTokens: 5, outputTokens: 1, totalTokens: 6 },
+          }),
+        );
         res.end();
         return;
       }

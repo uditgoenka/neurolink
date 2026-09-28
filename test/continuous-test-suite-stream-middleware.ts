@@ -3,8 +3,10 @@ import "dotenv/config";
 
 /**
  * Public generate()/stream() middleware contracts for the OpenAI-compatible
- * family. Local HTTP fixtures prove prompt rewrites, real tool execution,
- * guardrail blocking/filtering, error propagation, completion and cancellation.
+ * family, plus a dedicated Bedrock section near the end of the file (sibling
+ * PRs for AI Studio and Vertex add their own sections the same way). Local
+ * HTTP fixtures prove prompt rewrites, real tool execution, guardrail
+ * blocking/filtering, error propagation, completion and cancellation.
  * Runtime imports use only the built entry; type-only imports are erased.
  *
  * Run: pnpm run build && pnpm run test:stream-middleware
@@ -12,6 +14,12 @@ import "dotenv/config";
 
 import assert from "node:assert/strict";
 import { createServer, type IncomingMessage, type Server } from "node:http";
+import {
+  createServer as createHttp2Server,
+  type Http2Server,
+  type ServerHttp2Session,
+} from "node:http2";
+import { crc32 } from "node:zlib";
 import { once } from "node:events";
 import { z } from "zod";
 import type {
@@ -28,6 +36,10 @@ import {
   startScriptedChatServer,
   chatCompletion,
 } from "./helpers/mockChatServer.js";
+import {
+  startLocalBedrock,
+  PLACEHOLDER_AWS_ENV,
+} from "./helpers/bedrockLocalEndpoint.js";
 import { NeuroLink, tool } from "../dist/index.js";
 
 assertDistFresh();
@@ -1218,6 +1230,396 @@ await test("guardrail bad-word filtering catches a term split across adjacent te
     );
   } finally {
     await server.close();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// BEDROCK — the same model-middleware contract, proven against Amazon
+// Bedrock's native `generate()`/`stream()` paths. Bedrock goes through the
+// AWS SDK rather than `fetch`, so the stand-in is a local HTTP/2 server
+// pointed to via the SDK's own `AWS_ENDPOINT_URL_BEDROCK_RUNTIME` variable
+// (see `test/helpers/bedrockLocalEndpoint.ts`'s header) — a fetch
+// interceptor would never see these requests. Cancellation is proven by
+// aborting the AWS SDK command itself (the `turnAbort` `AbortController`
+// wired into `createBedrockLoopAdapter`'s per-step `abortSignal`), not by
+// closing a socket the SDK doesn't own.
+// ---------------------------------------------------------------------------
+
+const BEDROCK_MODEL = "us.anthropic.claude-haiku-4-5-20251001-v1:0";
+
+/**
+ * Points the AWS SDK at a local Bedrock stand-in for the duration of `fn` —
+ * the same env-swap `continuous-test-suite-provider-wiring.ts` and
+ * `continuous-test-suite-bedrock-loop-characterization.ts` use. Real SigV4
+ * signing, real routing; nothing reaches AWS. `AWS_SESSION_TOKEN` is
+ * explicitly cleared: a leftover session token from real assumed-role
+ * credentials elsewhere in the environment would otherwise be signed
+ * alongside the placeholder access key below and is never validated by the
+ * stand-in anyway.
+ */
+const withBedrockEnv = async <T>(
+  endpoint: string,
+  fn: () => Promise<T>,
+  extraEnv: Record<string, string> = {},
+): Promise<T> => {
+  const savedEnv = { ...process.env };
+  Object.assign(process.env, PLACEHOLDER_AWS_ENV, extraEnv, {
+    AWS_ENDPOINT_URL_BEDROCK_RUNTIME: endpoint,
+  });
+  delete process.env.AWS_SESSION_TOKEN;
+  try {
+    return await fn();
+  } finally {
+    for (const key of Object.keys(process.env)) {
+      if (!(key in savedEnv)) {
+        delete process.env[key];
+      }
+    }
+    Object.assign(process.env, savedEnv);
+  }
+};
+
+for (const mode of ["generate", "stream"] as const) {
+  await test(`Bedrock ${mode} applies model middleware and the transformParams rewrite reaches the wire`, async () => {
+    const local = await startLocalBedrock("OK");
+    const record = emptyRecord();
+    try {
+      await withBedrockEnv(local.endpoint, async () => {
+        const sdk = new NeuroLink();
+        try {
+          const options = {
+            input: { text: "hello" },
+            provider: "bedrock",
+            model: BEDROCK_MODEL,
+            disableTools: true,
+            disableInternalFallback: true,
+            middleware: middlewareOptions(record),
+          };
+          if (mode === "generate") {
+            await sdk.generate(options);
+          } else {
+            await bounded(readText(await sdk.stream(options)));
+          }
+        } finally {
+          await sdk.shutdown();
+        }
+      });
+
+      if (record.transformParamsCalls.length === 0) {
+        throw new Error(`probe never ran on Bedrock ${mode}`);
+      }
+      if (mode === "generate" && record.wrapGenerateCalls === 0) {
+        throw new Error(
+          "wrapGenerate never fired on the Bedrock generate path",
+        );
+      }
+      if (mode === "stream" && record.wrapStreamCalls === 0) {
+        throw new Error("wrapStream never fired on the Bedrock stream path");
+      }
+      if (local.requests.length === 0) {
+        throw new Error(`the Bedrock stand-in was never reached on ${mode}`);
+      }
+      const body = local.requests.at(-1)?.body ?? "";
+      if (!body.includes(MARKER)) {
+        throw new Error(
+          `the transformParams rewrite did not reach the wire on Bedrock ${mode}`,
+        );
+      }
+    } finally {
+      await local.close();
+    }
+  });
+}
+
+await test("Bedrock stream: wrapStream observes the V3 finish part carrying usage", async () => {
+  const local = await startLocalBedrock("OK");
+  const seen: LanguageModelV3StreamPart[] = [];
+  const observer: NeuroLinkMiddleware = {
+    specificationVersion: "v3",
+    metadata: { id: "bedrock-wire-observer", name: "Bedrock wire observer" },
+    wrapStream: async ({ doStream }) => {
+      const result = await doStream();
+      return {
+        ...result,
+        stream: result.stream.pipeThrough(
+          new TransformStream({
+            transform(part: LanguageModelV3StreamPart, controller) {
+              seen.push(part);
+              controller.enqueue(part);
+            },
+          }),
+        ),
+      };
+    },
+  };
+  try {
+    await withBedrockEnv(local.endpoint, async () => {
+      const sdk = new NeuroLink();
+      try {
+        const result = await sdk.stream({
+          input: { text: "hello" },
+          provider: "bedrock",
+          model: BEDROCK_MODEL,
+          disableTools: true,
+          disableInternalFallback: true,
+          middleware: {
+            middleware: [observer],
+            enabledMiddleware: ["bedrock-wire-observer"],
+          },
+        });
+        const text = await bounded(readText(result));
+        assert.equal(text, "OK", "stream text lost through the observer");
+      } finally {
+        await sdk.shutdown();
+      }
+    });
+
+    assert.ok(
+      local.requests.length > 0,
+      "the Bedrock stand-in was never reached",
+    );
+    const finish = seen.find(
+      (part): part is Extract<LanguageModelV3StreamPart, { type: "finish" }> =>
+        part.type === "finish",
+    );
+    assert.ok(finish, "no V3 finish part observed on the Bedrock stream");
+    // Exact values, not just non-zero: the stand-in's `metadata` event fixes
+    // inputTokens=5/outputTokens=1, so a match here is a genuine proof the
+    // AWS event-stream usage numbers flowed through readStreamedStep and the
+    // V3 bridge unchanged, not merely that some usage arrived.
+    assert.equal(
+      finish?.usage.outputTokens.total,
+      1,
+      "the V3 finish part did not carry the Bedrock stand-in's outputTokens",
+    );
+    assert.equal(
+      finish?.usage.inputTokens.total,
+      5,
+      "the V3 finish part did not carry the Bedrock stand-in's inputTokens",
+    );
+  } finally {
+    await local.close();
+  }
+});
+
+for (const mode of ["generate", "stream"] as const) {
+  await test(`Bedrock ${mode}: precall guardrail blocks the turn before it reaches the wire`, async () => {
+    const evaluator = await startScriptedChatServer([
+      chatCompletion({
+        content: JSON.stringify({
+          overall: "unsafe",
+          safetyScore: 1,
+          appropriatenessScore: 1,
+          confidenceLevel: 10,
+          suggestedAction: "block",
+          reasoning: "Deterministic blocking fixture",
+        }),
+      }),
+    ]);
+    const local = await startLocalBedrock("OK");
+    try {
+      await withBedrockEnv(
+        local.endpoint,
+        async () => {
+          const sdk = new NeuroLink();
+          try {
+            const options = {
+              input: { text: "block this request" },
+              provider: "bedrock",
+              model: BEDROCK_MODEL,
+              disableTools: true,
+              disableInternalFallback: true,
+              middleware: {
+                middlewareConfig: {
+                  guardrails: {
+                    enabled: true,
+                    config: {
+                      precallEvaluation: {
+                        enabled: true,
+                        provider: "openai-compatible",
+                        evaluationModel: "fixture-evaluator",
+                      },
+                    },
+                  },
+                },
+              },
+            };
+            const content =
+              mode === "generate"
+                ? (await sdk.generate(options)).content
+                : await bounded(readText(await sdk.stream(options)));
+            assert.ok(
+              evaluator.wasCalled(),
+              "guardrail evaluator was not exercised",
+            );
+            assert.equal(
+              local.requests.length,
+              0,
+              "blocked input reached the Bedrock stand-in",
+            );
+            assert.equal(
+              content,
+              "Request contains inappropriate content and has been blocked.",
+              "guardrail refusal was lost on Bedrock",
+            );
+          } finally {
+            await sdk.shutdown();
+          }
+        },
+        {
+          OPENAI_COMPATIBLE_API_KEY: "test-evaluator-key",
+          OPENAI_COMPATIBLE_BASE_URL: evaluator.baseURL,
+        },
+      );
+    } finally {
+      await local.close();
+      await evaluator.close();
+    }
+  });
+}
+
+/**
+ * A Bedrock ConverseStream stand-in that writes one text delta and then
+ * holds the HTTP/2 stream open, unlike `startLocalBedrock` (which writes the
+ * whole scripted reply and ends in one pass). Cancellation can only be
+ * proven against a stream that is still open when the consumer breaks out —
+ * this is otherwise the same event-stream framing as
+ * `test/helpers/bedrockLocalEndpoint.ts` and
+ * `continuous-test-suite-bedrock-loop-characterization.ts`'s own
+ * `encodeEventFrame`.
+ */
+async function startHoldOpenBedrockStream(): Promise<{
+  endpoint: string;
+  received: () => boolean;
+  closed: () => boolean;
+  close: () => Promise<void>;
+}> {
+  let received = false;
+  let closed = false;
+  const server: Http2Server = createHttp2Server();
+  const sessions = new Set<ServerHttp2Session>();
+  server.on("session", (session) => {
+    sessions.add(session);
+    session.on("close", () => sessions.delete(session));
+  });
+
+  const encodeEventFrame = (
+    type: string,
+    payload: Record<string, unknown>,
+  ): Buffer => {
+    const header = (name: string, value: string): Buffer => {
+      const n = Buffer.from(name, "utf8");
+      const v = Buffer.from(value, "utf8");
+      const len = Buffer.alloc(2);
+      len.writeUInt16BE(v.length);
+      return Buffer.concat([
+        Buffer.from([n.length]),
+        n,
+        Buffer.from([7]),
+        len,
+        v,
+      ]);
+    };
+    const headers = Buffer.concat([
+      header(":message-type", "event"),
+      header(":event-type", type),
+      header(":content-type", "application/json"),
+    ]);
+    const body = Buffer.from(JSON.stringify(payload), "utf8");
+    const totalLength = 12 + headers.length + body.length + 4;
+    const prelude = Buffer.alloc(8);
+    prelude.writeUInt32BE(totalLength, 0);
+    prelude.writeUInt32BE(headers.length, 4);
+    const preludeCrc = Buffer.alloc(4);
+    preludeCrc.writeUInt32BE(crc32(prelude) >>> 0, 0);
+    const head = Buffer.concat([prelude, preludeCrc, headers, body]);
+    const messageCrc = Buffer.alloc(4);
+    messageCrc.writeUInt32BE(crc32(head) >>> 0, 0);
+    return Buffer.concat([head, messageCrc]);
+  };
+
+  server.on("stream", (h2stream) => {
+    received = true;
+    h2stream.on("close", () => {
+      closed = true;
+    });
+    // Drain the request so the client is never left waiting on backpressure
+    // for a body nothing reads.
+    h2stream.on("data", () => undefined);
+    h2stream.respond({
+      ":status": 200,
+      "content-type": "application/vnd.amazon.eventstream",
+    });
+    h2stream.write(encodeEventFrame("messageStart", { role: "assistant" }));
+    h2stream.write(
+      encodeEventFrame("contentBlockDelta", {
+        contentBlockIndex: 0,
+        delta: { text: "first " },
+      }),
+    );
+    // Deliberately no contentBlockStop/messageStop/end() — the point is to
+    // hold the stream open so the consumer can break out of it mid-stream.
+  });
+
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  const port = typeof address === "object" && address ? address.port : 0;
+
+  return {
+    endpoint: `http://127.0.0.1:${port}`,
+    received: () => received,
+    closed: () => closed,
+    close: () =>
+      new Promise<void>((resolve) => {
+        for (const session of sessions) {
+          session.destroy();
+        }
+        server.close(() => resolve());
+      }),
+  };
+}
+
+await test("Bedrock stream: breaking out of a wrapped stream cancels the upstream request", async () => {
+  const local = await startHoldOpenBedrockStream();
+  try {
+    await withBedrockEnv(local.endpoint, async () => {
+      const sdk = new NeuroLink();
+      try {
+        const result = await sdk.stream({
+          input: { text: "hello" },
+          provider: "bedrock",
+          model: BEDROCK_MODEL,
+          disableTools: true,
+          disableInternalFallback: true,
+          middleware: middlewareOptions(emptyRecord()),
+        });
+        await bounded(
+          (async () => {
+            for await (const chunk of result.stream) {
+              if ("content" in chunk && chunk.content) {
+                break;
+              }
+            }
+          })(),
+        );
+        assert.ok(local.received(), "Bedrock stand-in was never reached");
+        await bounded(
+          (async () => {
+            while (!local.closed()) {
+              await new Promise((resolve) => setTimeout(resolve, 10));
+            }
+          })(),
+        );
+        assert.ok(
+          local.closed(),
+          "upstream Bedrock request stayed open after breaking out of the stream",
+        );
+      } finally {
+        await sdk.shutdown();
+      }
+    });
+  } finally {
+    await local.close();
   }
 });
 
