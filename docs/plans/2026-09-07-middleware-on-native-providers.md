@@ -1,6 +1,11 @@
 # Model middleware on Vertex, AI Studio and Bedrock
 
-> **Status:** specification. Nothing here is implemented.
+> **Status:** AI Studio and Vertex are implemented (both `generate()` and
+> `stream()`, via a synthetic V3 model bridge in each provider's own client).
+> Bedrock is not — its client still contains zero references to
+> `prepareGenerationContext`, `getAISDKModelWithMiddleware` or
+> `applyMiddlewareToModel`, so its native loops remain the one gap this plan
+> described.
 >
 > **Goal:** make `transformParams` / `wrapGenerate` / `wrapStream` run on the
 > three providers that bypass them entirely, on both `generate()` and
@@ -30,14 +35,18 @@ The fifth entry matters, and an earlier draft of this spec got it wrong by
 calling it deleted. `prepareGenerationContext` is live; it is the seam a
 provider reaches by going through `BaseProvider.runGenerateInActiveContext`.
 
-`googleVertex`, `googleAiStudio` and `amazonBedrock` still reach none of the
-five. Verified per file rather than assumed: Vertex and Bedrock contain zero
-references to `prepareGenerationContext`, `getAISDKModelWithMiddleware` or
-`applyMiddlewareToModel`; AI Studio's only mention of
-`runGenerateInActiveContext` is a comment saying it replicates that dispatch
-**because its override bypasses that path**.
-Each overrides `generate()` and `executeStream()` with a native path that
-never wraps its model, so for those three:
+At the time this plan was written, `googleVertex`, `googleAiStudio` and
+`amazonBedrock` reached none of the five: each overrode `generate()` and
+`executeStream()` with a native path that never wrapped its model. AI Studio
+and Vertex have since closed that gap, each through its own synthetic V3
+model bridge rather than through one of the five call sites above — the
+bridge builds a `LanguageModelV3` whose `doGenerate`/`doStream` drives the
+native loop, wraps it with `applyMiddlewareToModel`, and reads the
+middleware-transformed params back onto the native request. `amazonBedrock`
+is unchanged: verified per file, it still contains zero references to
+`prepareGenerationContext`, `getAISDKModelWithMiddleware` or
+`applyMiddlewareToModel`, so the description below (as of this writing) still
+applies to Bedrock alone:
 
 - `transformParams` never fires — a middleware that rewrites the prompt,
   `maxOutputTokens`, `temperature` or `topP` is silently ignored

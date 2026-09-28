@@ -64,6 +64,12 @@ import type {
   MultimodalAudioEntry,
   MultimodalVideoEntry,
   ProviderErrorRule,
+  LanguageModelV3,
+  LanguageModelV3CallOptions,
+  LanguageModelV3StreamPart,
+  ModelMessage,
+  TokenUsage,
+  MiddlewareFactoryOptions,
 } from "../../types/index.js";
 import {
   AuthenticationError,
@@ -83,6 +89,7 @@ import {
 } from "../../utils/messageBuilder.js";
 import { logger } from "../../utils/logger.js";
 import { drainDetachedPump } from "../../utils/drainDetachedPump.js";
+import { releaseIterator } from "../../utils/streamCancellation.js";
 import {
   GEMINI_ELISION_NOTE,
   planGeminiLoopReclaim,
@@ -625,6 +632,126 @@ const createVertexAnthropicSettings = async (
 const isAnthropicModel = (modelName: string): boolean => {
   return modelName.toLowerCase().includes("claude");
 };
+
+/**
+ * Bridge a native Vertex stream loop's chunk iterable into a V3
+ * `ReadableStream`, so `wrapLanguageModel`'s `doStream` can drive it through
+ * the middleware chain. Lazy and pull-based — one native chunk in, one V3
+ * part out per `pull()` — because the native Anthropic loop
+ * (`executeNativeAnthropicStream`) is genuinely live: it returns its
+ * `StreamResult` while a background loop is still generating, with
+ * `usage`/`finishReason` as getters that settle only once the loop's
+ * channel closes. Eagerly draining the source here would silently turn that
+ * real-time stream into collect-then-replay. The Gemini3 loop's chunks are
+ * already fully resolved by the time this runs, so the same lazy pull is
+ * just as correct there — it has nothing left to wait on.
+ *
+ * Mirrors `chunksToV3Stream` in `openaiChatCompletionsBase.ts`, which is not
+ * exported, hence a local copy adapted to the native `{content, reasoning?}`
+ * chunk shape instead of `OpenAICompatStreamChunk`.
+ *
+ * `cancel()` releases the native iterator without awaiting it
+ * (`releaseIterator`), and the not-awaiting is what matters. The native
+ * `source` is `createStreamChannel`'s single-flight generator: `.return()`
+ * called while a `.next()` is in flight is queued behind it and only runs once
+ * that pending `.next()` settles (the next upstream frame, or the loop's own
+ * turn clock). A `ReadableStream` with the default `highWaterMark` calls
+ * `pull()` ahead of demand, so a `.next()` is routinely outstanding when the
+ * consumer breaks. Awaiting `iterator.return()` here would hold open
+ * `v3StreamToNativeChunks`'s `reader.cancel()`, and with it the `for await`
+ * exit inside `BaseProvider`'s lifecycle wrapper, whose `finally` is what runs
+ * `teardown()` — the abort of the call's own signal that actually releases the
+ * upstream connection. A held-open upstream would then keep the consumer's
+ * `break` parked until a frame or the turn clock arrived. Releasing without
+ * waiting lets `teardown()` run at once; the queued `.return()` then completes
+ * by itself once that abort settles the pending `.next()`.
+ */
+const nativeChunksToV3Stream = (
+  source: StreamResult["stream"],
+  completion: () => LanguageModelV3StreamPart,
+): ReadableStream<LanguageModelV3StreamPart> => {
+  const iterator = source[Symbol.asyncIterator]();
+  return new ReadableStream<LanguageModelV3StreamPart>({
+    async pull(controller) {
+      try {
+        const next = await iterator.next();
+        if (next.done) {
+          controller.enqueue(completion());
+          controller.close();
+          return;
+        }
+        const chunk = next.value;
+        if ("content" in chunk && typeof chunk.content === "string") {
+          if (
+            "reasoning" in chunk &&
+            typeof chunk.reasoning === "string" &&
+            chunk.reasoning.length > 0
+          ) {
+            controller.enqueue({
+              type: "reasoning-delta",
+              delta: chunk.reasoning,
+            });
+          }
+          if (chunk.content.length > 0) {
+            controller.enqueue({ type: "text-delta", delta: chunk.content });
+          }
+        }
+      } catch (error) {
+        controller.error(error);
+      }
+    },
+    cancel() {
+      releaseIterator(iterator);
+    },
+  });
+};
+
+/**
+ * Drain a V3 `ReadableStream` (the middleware-wrapped native stream) back
+ * into the `{content, reasoning?}` chunk shape `StreamResult.stream`
+ * callers already iterate. `onFinish` captures the terminal `finish` part
+ * instead of yielding it — native chunk consumers have never seen a
+ * finish-shaped chunk and don't expect one.
+ *
+ * Mirrors `v3StreamToChunks` in `openaiChatCompletionsBase.ts` (also not
+ * exported).
+ */
+async function* v3StreamToNativeChunks(
+  stream: ReadableStream<LanguageModelV3StreamPart>,
+  onFinish: (
+    part: Extract<LanguageModelV3StreamPart, { type: "finish" }>,
+  ) => void,
+): AsyncGenerator<{ content: string; reasoning?: string }> {
+  const reader = stream.getReader();
+  let done = false;
+  try {
+    while (true) {
+      const next = await reader.read();
+      if (next.done) {
+        done = true;
+        return;
+      }
+      const part = next.value;
+      if (part.type === "text-delta") {
+        yield { content: part.delta };
+      } else if (part.type === "reasoning-delta") {
+        yield { content: "", reasoning: part.delta };
+      } else if (part.type === "finish") {
+        onFinish(part);
+      } else if (part.type === "error") {
+        throw part.error;
+      }
+    }
+  } finally {
+    try {
+      if (!done) {
+        await reader.cancel();
+      }
+    } finally {
+      reader.releaseLock();
+    }
+  }
+}
 
 /**
  * Google Vertex AI Provider v2 - BaseProvider Implementation
@@ -1274,7 +1401,12 @@ export class GoogleVertexProvider extends BaseProvider {
                 totalToolCount: Object.keys(optionTools).length,
               },
             );
-            result = await this.executeNativeAnthropicStream(mergedOptions);
+            result = await this.runNativeStreamWithMiddleware(
+              mergedOptions,
+              modelName,
+              (effectiveOptions) =>
+                this.executeNativeAnthropicStream(effectiveOptions),
+            );
           } else {
             // ALL Gemini models use native @google/genai SDK
             logger.info(
@@ -1284,7 +1416,12 @@ export class GoogleVertexProvider extends BaseProvider {
                 totalToolCount: Object.keys(optionTools).length,
               },
             );
-            result = await this.executeNativeGemini3Stream(mergedOptions);
+            result = await this.runNativeStreamWithMiddleware(
+              mergedOptions,
+              modelName,
+              (effectiveOptions) =>
+                this.executeNativeGemini3Stream(effectiveOptions),
+            );
           }
           // Cost / token usage on the stream span. Native streams resolve
           // usage synchronously (the stream loop has already drained), so
@@ -7154,8 +7291,12 @@ export class GoogleVertexProvider extends BaseProvider {
                     totalToolCount: Object.keys(mergedOptions.tools).length,
                   },
                 );
-                nativeResult =
-                  await this.executeNativeAnthropicGenerate(mergedOptions);
+                nativeResult = await this.runNativeGenerateWithMiddleware(
+                  mergedOptions,
+                  modelName,
+                  (effectiveOptions) =>
+                    this.executeNativeAnthropicGenerate(effectiveOptions),
+                );
               } else {
                 logger.info(
                   "[GoogleVertex] Routing Gemini generate to native @google/genai",
@@ -7164,55 +7305,15 @@ export class GoogleVertexProvider extends BaseProvider {
                     totalToolCount: Object.keys(mergedOptions.tools).length,
                   },
                 );
-                try {
-                  nativeResult =
-                    await this.executeNativeGemini3Generate(mergedOptions);
-                } catch (nativeError) {
-                  // Vertex rejects over-constrained responseSchemas with a
-                  // deterministic 400 ("too many states" — constrained-decoding
-                  // state explosion). Re-sending the same schema can never
-                  // succeed, so retry ONCE with the schema dropped but JSON
-                  // mode kept: output.format "json" still sets
-                  // responseMimeType application/json on the no-tools path,
-                  // so the model is forced to emit JSON — just without the
-                  // offending schema constraints. The NeuroLink layer then
-                  // coerces the JSON text into the caller's original schema
-                  // (generate({schema}) guarantee holds).
-                  const requestedStructured =
-                    mergedOptions.schema !== undefined ||
-                    mergedOptions.output?.format === "json";
-                  // Tools present → the executor skips responseMimeType, so a
-                  // schema-less retry would NOT actually run in JSON mode and
-                  // the structured-output contract would silently degrade to
-                  // prose. Only the no-tools case retries faithfully; with
-                  // tools, surface the 400 to the caller instead.
-                  const hasTools =
-                    !mergedOptions.disableTools &&
-                    Object.keys(mergedOptions.tools ?? {}).length > 0;
-                  if (
-                    requestedStructured &&
-                    !hasTools &&
-                    isSchemaComplexityError(nativeError)
-                  ) {
-                    logger.warn(
-                      "[GoogleVertex] responseSchema too complex for constrained decoding — retrying native generate in schema-less JSON mode",
-                      {
-                        model: modelName,
-                        error:
-                          nativeError instanceof Error
-                            ? nativeError.message
-                            : String(nativeError),
-                      },
-                    );
-                    nativeResult = await this.executeNativeGemini3Generate({
-                      ...mergedOptions,
-                      schema: undefined,
-                      output: { format: "json" },
-                    });
-                  } else {
-                    throw nativeError;
-                  }
-                }
+                nativeResult = await this.runNativeGenerateWithMiddleware(
+                  mergedOptions,
+                  modelName,
+                  (effectiveOptions) =>
+                    this.executeNativeGemini3GenerateWithSchemaFallback(
+                      effectiveOptions,
+                      modelName,
+                    ),
+                );
               }
               executionSpan.setAttribute(
                 LANGFUSE_ATTR.OBSERVATION_OUTPUT,
@@ -7426,6 +7527,518 @@ export class GoogleVertexProvider extends BaseProvider {
       ...result,
       stream: wrappedIterable as StreamResult["stream"],
     });
+  }
+
+  /**
+   * Build the V3 entry-turn prompt middleware sees for a native call.
+   * Native Vertex loops build their own multi-turn conversation internally
+   * once they run — this is only the caller's system prompt + text input,
+   * the one turn middleware is given visibility into before that loop
+   * starts.
+   *
+   * The user turn is an array of text parts rather than a bare string. That
+   * is the V3 prompt shape, and prompt-editing middleware is written against
+   * it: one that spreads `content` into a longer array turns a string into
+   * one element per character, and one that calls `.map` / `.filter` on it
+   * throws. The AI Studio path already hands its middleware parts
+   * (`geminiContentsToV3Prompt`); this makes Vertex agree with it.
+   */
+  private buildTurnPromptForMiddleware(
+    options: TextGenerationOptions | StreamOptions,
+  ): ModelMessage[] {
+    const prompt: ModelMessage[] = [];
+    if (options.systemPrompt) {
+      prompt.push({ role: "system", content: options.systemPrompt });
+    }
+    prompt.push({
+      role: "user",
+      content: [{ type: "text", text: options.input?.text ?? "" }],
+    });
+    return prompt;
+  }
+
+  /** Sampling params a native call already honors, carried onto the V3 view. */
+  private buildTurnV3Params(
+    options: TextGenerationOptions | StreamOptions,
+    prompt: ModelMessage[],
+  ): LanguageModelV3CallOptions {
+    return {
+      prompt,
+      ...(options.maxTokens !== undefined
+        ? { maxOutputTokens: options.maxTokens }
+        : {}),
+      ...(options.temperature !== undefined
+        ? { temperature: options.temperature }
+        : {}),
+      ...(options.topP !== undefined ? { topP: options.topP } : {}),
+      ...(options.abortSignal !== undefined
+        ? { abortSignal: options.abortSignal }
+        : {}),
+    };
+  }
+
+  /**
+   * Read a middleware-transformed prompt back into the two things a native
+   * Vertex turn can carry: one system instruction and one user text.
+   *
+   * Every system message counts (joined with a blank line, the way
+   * `v3PromptToGeminiContents` joins them for AI Studio) and so does every
+   * user message, not just the last. A middleware that appends or prepends
+   * context leaves the caller's own text in the prompt beside it; reading
+   * only the last user message would send the addition without the question
+   * it was meant to qualify, or drop it and send the question bare. Text
+   * blocks — across messages and across the parts of one message — are joined
+   * with a blank line for the same reason: they are separate blocks, and
+   * gluing them runs the last word of one into the first of the next.
+   *
+   * `unmapped` counts what a native turn has no place for — non-text user
+   * parts (files, images) and assistant or tool messages — so the caller can
+   * say it was dropped rather than drop it silently.
+   */
+  private readTurnFromPrompt(prompt: LanguageModelV3CallOptions["prompt"]): {
+    systemPrompt: string | undefined;
+    text: string;
+    unmapped: number;
+  } {
+    const systemTexts = prompt.flatMap((message) =>
+      message.role === "system" ? [message.content] : [],
+    );
+    const userContents = prompt.flatMap((message) =>
+      message.role === "user" ? [message.content] : [],
+    );
+    const userTexts = userContents
+      .flatMap((content) =>
+        typeof content === "string"
+          ? [content]
+          : content.flatMap((part) =>
+              part.type === "text" ? [part.text] : [],
+            ),
+      )
+      .filter((text) => text.length > 0);
+    const unmappedParts = userContents.reduce(
+      (count, content) =>
+        typeof content === "string"
+          ? count
+          : count + content.filter((part) => part.type !== "text").length,
+      0,
+    );
+    const unmappedMessages = prompt.filter(
+      (message) => message.role !== "system" && message.role !== "user",
+    ).length;
+    return {
+      systemPrompt:
+        systemTexts.length > 0 ? systemTexts.join("\n\n") : undefined,
+      text: userTexts.join("\n\n"),
+      unmapped: unmappedParts + unmappedMessages,
+    };
+  }
+
+  /**
+   * Apply a middleware-transformed turn back onto the native call options.
+   *
+   * The system instruction and the user text are each written back only when
+   * they differ from what the caller passed, so a middleware that touches
+   * neither leaves both exactly as they were. An edit is honoured in every
+   * direction — a changed, added or removed system message, an appended or
+   * prepended user message — because the wire request is built from
+   * `options.systemPrompt` and `options.input.text`, and nothing else in this
+   * call reads the V3 view again.
+   *
+   * Sampling params are written back the same way and can be removed as well
+   * as changed: a middleware that drops `temperature` or `topP` from the
+   * params must reach the wire as "not sent", not as the caller's original
+   * value kept because the key went missing.
+   *
+   * `tools` is offered to middleware read-only — a middleware that rewrites
+   * it gets a WARN rather than a silent drop, matching the OpenAI-compatible
+   * streaming path's contract: native tool wiring is derived independently
+   * of this V3 view, and re-deriving it here would diverge from it.
+   */
+  private applyTurnParamsRewrite<
+    T extends TextGenerationOptions | StreamOptions,
+  >(options: T, params: LanguageModelV3CallOptions): T {
+    if (params.tools !== undefined) {
+      logger.warn(
+        "[GoogleVertex] middleware rewrote 'tools' on the native path; tool rewrites are not applied to the native request — the original tool list was sent.",
+      );
+    }
+    const turn = this.readTurnFromPrompt(params.prompt);
+    if (turn.unmapped > 0) {
+      logger.warn(
+        `[GoogleVertex] middleware added ${turn.unmapped} prompt item(s) the native request cannot carry (non-text user parts, assistant or tool messages); only system and user text edits are applied — those items were not sent.`,
+      );
+    }
+    const maxTokens =
+      typeof params.maxOutputTokens === "number"
+        ? params.maxOutputTokens
+        : undefined;
+    const temperature =
+      typeof params.temperature === "number" ? params.temperature : undefined;
+    const topP = typeof params.topP === "number" ? params.topP : undefined;
+    return {
+      ...options,
+      ...(turn.systemPrompt !== (options.systemPrompt || undefined)
+        ? { systemPrompt: turn.systemPrompt }
+        : {}),
+      ...(turn.text !== (options.input?.text ?? "")
+        ? { input: { ...(options.input ?? {}), text: turn.text } }
+        : {}),
+      ...(maxTokens !== options.maxTokens ? { maxTokens } : {}),
+      ...(temperature !== options.temperature ? { temperature } : {}),
+      ...(topP !== options.topP ? { topP } : {}),
+    } as T;
+  }
+
+  /**
+   * Strip the lifecycle middleware from the options handed to
+   * `applyMiddlewareToModel` for a native Vertex call, when something else is
+   * already firing the same callbacks.
+   *
+   * NeuroLink's `applyGenerateLifecycleMiddleware` /
+   * `applyStreamLifecycleMiddleware` (neurolink.ts) mirror a caller's
+   * top-level `onFinish` / `onError` / `onChunk` into
+   * `options.middleware.middlewareConfig.lifecycle.config` — the exact same
+   * callback references — before this provider sees `options`. Left enabled,
+   * the built-in lifecycle middleware would fire them again from inside the
+   * bridge, and with malformed payloads: it reads the legacy `textDelta` chunk
+   * field and a bare `finishReason`, neither of which a V3 model produces.
+   *
+   * Who else fires them differs by path, so the exclusion does too:
+   *
+   * - generate: only `fireGenerateOnFinish` / `fireGenerateOnError`, which read
+   *   the TOP-LEVEL callbacks. The entry is stripped only when one is present.
+   *   A caller who configures `middlewareConfig.lifecycle` directly has no
+   *   other firer here, so that middleware applies exactly once, unmodified.
+   * - stream: `BaseProvider.stream()` wraps every stream in
+   *   `wrapStreamWithLifecycleCallbacks`, which fires whatever sits in
+   *   `lifecycle.config` however it got there — top-level shorthand or direct
+   *   config. The entry is stripped whenever it exists, or a direct-config
+   *   caller would get every callback twice (and `onChunk` a third time, for
+   *   the `finish` part the middleware also reports).
+   *
+   * Only the `lifecycle` entry is disabled, so every other configured
+   * middleware (guardrails, transformParams, custom hooks, analytics, ...)
+   * applies normally.
+   */
+  private excludeAutoLifecycleMiddleware<
+    T extends TextGenerationOptions | StreamOptions,
+  >(options: T, path: "generate" | "stream"): T {
+    const opts = options as T & {
+      onFinish?: unknown;
+      onError?: unknown;
+      onChunk?: unknown;
+      middleware?: MiddlewareFactoryOptions;
+    };
+    const firedElsewhere =
+      path === "stream" || !!(opts.onFinish || opts.onError || opts.onChunk);
+    if (!firedElsewhere) {
+      return options;
+    }
+    const lifecycle = opts.middleware?.middlewareConfig?.lifecycle;
+    if (!lifecycle) {
+      return options;
+    }
+    return {
+      ...options,
+      middleware: {
+        ...opts.middleware,
+        middlewareConfig: {
+          ...opts.middleware?.middlewareConfig,
+          lifecycle: { ...lifecycle, enabled: false },
+        },
+      },
+    } as T;
+  }
+
+  /**
+   * Run the native Gemini generate loop and, when Vertex rejects an
+   * over-constrained `responseSchema`, retry once without it.
+   *
+   * The retry sits inside the function `runNativeGenerateWithMiddleware` hands
+   * to the model bridge rather than around the bridge, because it is
+   * provider-internal recovery: model middleware must see one `doGenerate`
+   * that succeeds. Retrying outside would show every middleware the failed
+   * first call — the lifecycle middleware would report an `onError` for a
+   * request that then succeeded, and `transformParams` would run twice.
+   */
+  private async executeNativeGemini3GenerateWithSchemaFallback(
+    options: TextGenerationOptions,
+    modelName: string,
+  ): Promise<EnhancedGenerateResult> {
+    try {
+      return await this.executeNativeGemini3Generate(options);
+    } catch (nativeError) {
+      // Vertex rejects over-constrained responseSchemas with a
+      // deterministic 400 ("too many states" — constrained-decoding
+      // state explosion). Re-sending the same schema can never
+      // succeed, so retry ONCE with the schema dropped but JSON
+      // mode kept: output.format "json" still sets
+      // responseMimeType application/json on the no-tools path,
+      // so the model is forced to emit JSON — just without the
+      // offending schema constraints. The NeuroLink layer then
+      // coerces the JSON text into the caller's original schema
+      // (generate({schema}) guarantee holds).
+      const requestedStructured =
+        options.schema !== undefined || options.output?.format === "json";
+      // Tools present → the executor skips responseMimeType, so a
+      // schema-less retry would NOT actually run in JSON mode and
+      // the structured-output contract would silently degrade to
+      // prose. Only the no-tools case retries faithfully; with
+      // tools, surface the 400 to the caller instead.
+      const hasTools =
+        !options.disableTools && Object.keys(options.tools ?? {}).length > 0;
+      if (
+        requestedStructured &&
+        !hasTools &&
+        isSchemaComplexityError(nativeError)
+      ) {
+        logger.warn(
+          "[GoogleVertex] responseSchema too complex for constrained decoding — retrying native generate in schema-less JSON mode",
+          {
+            model: modelName,
+            error:
+              nativeError instanceof Error
+                ? nativeError.message
+                : String(nativeError),
+          },
+        );
+        return await this.executeNativeGemini3Generate({
+          ...options,
+          schema: undefined,
+          output: { format: "json" },
+        });
+      }
+      throw nativeError;
+    }
+  }
+
+  /**
+   * Apply the configured middleware chain around a native Vertex generate
+   * loop. `callNative` is `executeNativeAnthropicGenerate` or
+   * `executeNativeGemini3Generate` — a self-contained black box that runs
+   * its own multi-step tool loop and returns a fully-resolved
+   * `EnhancedGenerateResult`. Wrapping happens around that call, not inside
+   * it: `transformParams` can rewrite the entry turn before the loop starts,
+   * and `wrapGenerate` can observe the result or replace it outright (a
+   * guardrail that blocks the call entirely never reaches `callNative`, so
+   * `nativeResult` stays unset and a settled result is synthesized purely
+   * from what middleware produced, then run through `enhanceResult` like any
+   * other result so `enableAnalytics` / `enableEvaluation` still apply).
+   */
+  private async runNativeGenerateWithMiddleware(
+    options: TextGenerationOptions,
+    modelName: string,
+    callNative: (
+      effectiveOptions: TextGenerationOptions,
+    ) => Promise<EnhancedGenerateResult>,
+  ): Promise<EnhancedGenerateResult> {
+    const startedAt = Date.now();
+    const originalPrompt = this.buildTurnPromptForMiddleware(options);
+    const providerName = this.providerName;
+    let nativeResult: EnhancedGenerateResult | undefined;
+    const baseModel: LanguageModelV3 = {
+      specificationVersion: "v3",
+      provider: providerName,
+      modelId: modelName,
+      supportedUrls: {},
+      doGenerate: async (params) => {
+        const effectiveOptions = this.applyTurnParamsRewrite(options, params);
+        const result = await callNative(effectiveOptions);
+        nativeResult = result;
+        return {
+          content: [{ type: "text", text: result.content }],
+          finishReason: { unified: result.finishReason ?? "stop" },
+          usage: {
+            inputTokens: { total: result.usage?.input ?? 0 },
+            outputTokens: { total: result.usage?.output ?? 0 },
+          },
+        };
+      },
+      doStream: () => {
+        throw new Error(
+          "[GoogleVertex] doStream is not implemented on the native generate middleware model — this path only drives doGenerate.",
+        );
+      },
+    };
+
+    const modelResult = await this.applyMiddlewareToModel(
+      baseModel,
+      this.excludeAutoLifecycleMiddleware(options, "generate"),
+    );
+    if (typeof modelResult === "string") {
+      throw new Error(
+        "[GoogleVertex] Native generate model handle required for middleware",
+      );
+    }
+    const wrappedModel = modelResult;
+    const v3Params = this.buildTurnV3Params(options, originalPrompt);
+    const v3Result = await wrappedModel.doGenerate(v3Params);
+    const v3Text = v3Result.content
+      .map((part) => (part.type === "text" ? part.text : ""))
+      .join("");
+
+    if (nativeResult) {
+      // Reference/value equality against what the native call itself
+      // returned is the "nothing changed" signal — return the native result
+      // untouched (structuredData, toolCalls, analytics and all) rather than
+      // a reconstruction that would drop fields this function doesn't know
+      // about. Only a middleware that actually rewrote the text pays for a
+      // merged object.
+      return v3Text === nativeResult.content
+        ? nativeResult
+        : { ...nativeResult, content: v3Text };
+    }
+
+    // Guardrails (or any middleware) blocked the call before `doGenerate`
+    // ran — synthesize a settled result purely from the V3 response
+    // middleware produced, the same "no native call, no content" contract
+    // the OpenAI-compatible path's blocking case already proves out. The
+    // turn bookkeeping a real loop would have filled in takes short-circuit
+    // defaults, and `enhanceResult` runs on it as on every unblocked result:
+    // without it a blocked call silently loses `analytics` / `evaluation`
+    // that the same call would have carried had the guardrail let it through.
+    return this.enhanceResult(
+      {
+        content: v3Text,
+        provider: providerName,
+        model: modelName,
+        finishReason: v3Result.finishReason.unified,
+        usage: {
+          input: v3Result.usage.inputTokens.total ?? 0,
+          output: v3Result.usage.outputTokens.total ?? 0,
+          total:
+            (v3Result.usage.inputTokens.total ?? 0) +
+            (v3Result.usage.outputTokens.total ?? 0),
+        },
+        toolCalls: [],
+        stopReason: resolveTurnStopReason({
+          timedOut: false,
+          stalled: false,
+          wasAborted: false,
+          cappedWithoutAnswer: false,
+          finishReason: v3Result.finishReason.unified,
+        }),
+        stepsUsed: 0,
+        responseTime: Date.now() - startedAt,
+        toolsUsed: [],
+        toolExecutions: [],
+        enhancedWithTools: false,
+      },
+      options,
+      startedAt,
+    );
+  }
+
+  /**
+   * Apply the configured middleware chain around a native Vertex stream
+   * loop. `callNative` is `executeNativeAnthropicStream` or
+   * `executeNativeGemini3Stream`. Both are bridged through the same lazy V3
+   * `ReadableStream` (`nativeChunksToV3Stream` / `v3StreamToNativeChunks`)
+   * regardless of whether the underlying loop is genuinely live (Anthropic)
+   * or already fully resolved (Gemini3) by the time it returns — pulling one
+   * item at a time is correct for both, and never turns a live stream into
+   * collect-then-replay.
+   *
+   * A guardrail that blocks the call never invokes `doStream`, so
+   * `nativeResult` stays unset; a `StreamResult` is synthesized instead,
+   * with `usage` / `finishReason` resolving once the merged stream is fully
+   * drained (the same late-resolving-getter contract
+   * `preserveStreamResultAccessors` already exists for).
+   */
+  private async runNativeStreamWithMiddleware(
+    options: StreamOptions,
+    modelName: string,
+    callNative: (effectiveOptions: StreamOptions) => Promise<StreamResult>,
+  ): Promise<StreamResult> {
+    const originalPrompt = this.buildTurnPromptForMiddleware(options);
+    const providerName = this.providerName;
+    let nativeResult: StreamResult | undefined;
+    const baseModel: LanguageModelV3 = {
+      specificationVersion: "v3",
+      provider: providerName,
+      modelId: modelName,
+      supportedUrls: {},
+      doGenerate: () => {
+        throw new Error(
+          "[GoogleVertex] doGenerate is not implemented on the native stream middleware model — this path only drives doStream.",
+        );
+      },
+      doStream: async (params) => {
+        const effectiveOptions = this.applyTurnParamsRewrite(options, params);
+        const result = await callNative(effectiveOptions);
+        nativeResult = result;
+        return {
+          stream: nativeChunksToV3Stream(result.stream, () => ({
+            type: "finish",
+            finishReason: { unified: result.finishReason ?? "stop" },
+            usage: {
+              inputTokens: { total: result.usage?.input ?? 0 },
+              outputTokens: { total: result.usage?.output ?? 0 },
+            },
+          })),
+        };
+      },
+    };
+
+    const modelResult = await this.applyMiddlewareToModel(
+      baseModel,
+      this.excludeAutoLifecycleMiddleware(options, "stream"),
+    );
+    if (typeof modelResult === "string") {
+      throw new Error(
+        "[GoogleVertex] Native stream model handle required for middleware",
+      );
+    }
+    const wrappedModel = modelResult;
+    const v3Params = this.buildTurnV3Params(options, originalPrompt);
+    const { stream } = await wrappedModel.doStream(v3Params);
+
+    let finishPart:
+      | Extract<LanguageModelV3StreamPart, { type: "finish" }>
+      | undefined;
+    const mergedStream = v3StreamToNativeChunks(stream, (part) => {
+      finishPart = part;
+    });
+
+    if (nativeResult) {
+      const settled = nativeResult;
+      return this.preserveStreamResultAccessors(settled, {
+        ...settled,
+        stream: mergedStream,
+      });
+    }
+
+    // Guardrails (or any middleware) blocked the call before `doStream`
+    // ran — synthesize a settled StreamResult purely from the V3 stream
+    // middleware produced. `usage` / `finishReason` are getters so a
+    // consumer who reads them before draining `stream` doesn't just see a
+    // permanent snapshot of "nothing yet" — same contract the native
+    // Anthropic path's own getters already rely on.
+    const blockedResult: StreamResult = {
+      stream: mergedStream,
+      provider: providerName,
+      model: modelName,
+    };
+    Object.defineProperty(blockedResult, "usage", {
+      enumerable: true,
+      configurable: true,
+      get: (): TokenUsage | undefined =>
+        finishPart
+          ? {
+              input: finishPart.usage.inputTokens.total ?? 0,
+              output: finishPart.usage.outputTokens.total ?? 0,
+              total:
+                (finishPart.usage.inputTokens.total ?? 0) +
+                (finishPart.usage.outputTokens.total ?? 0),
+            }
+          : undefined,
+    });
+    Object.defineProperty(blockedResult, "finishReason", {
+      enumerable: true,
+      configurable: true,
+      get: (): string | undefined => finishPart?.finishReason.unified,
+    });
+    return blockedResult;
   }
 
   /**
