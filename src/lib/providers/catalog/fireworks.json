@@ -8,12 +8,11 @@
     "baseURL": "https://api.fireworks.ai/inference/v1"
   },
   "models": {
-    "default": "accounts/fireworks/models/kimi-k2p6",
+    "default": "accounts/fireworks/models/kimi-k3",
     "fallbackModelName": "accounts/fireworks/models/gpt-oss-120b",
     "fallbacks": [
-      "accounts/fireworks/models/kimi-k2p6",
-      "accounts/fireworks/models/gpt-oss-120b",
       "accounts/fireworks/models/kimi-k3",
+      "accounts/fireworks/models/gpt-oss-120b",
       "accounts/fireworks/models/qwen3p8-max",
       "accounts/fireworks/models/glm-5p3"
     ],
@@ -23,8 +22,8 @@
       "accounts/fireworks/models/kimi-k2p6": {
         "enumMember": "KIMI_K2P6",
         "vision": true,
-        "status": "production",
-        "description": "Recommended - Kimi K2.6, Moonshot flagship; vision-capable"
+        "status": "retired",
+        "description": "Retired 2026-09 — still listed on the Fireworks /models roster but the chat endpoint 404s 'Model not found, inaccessible, and/or not deployed'; superseded by kimi-k3, same Moonshot family"
       },
       "accounts/fireworks/models/gpt-oss-120b": {
         "enumMember": "GPT_OSS_120B",
@@ -106,10 +105,10 @@
       }
     },
     "topModels": [
-      "accounts/fireworks/models/kimi-k2p6",
-      "accounts/fireworks/models/gpt-oss-120b",
       "accounts/fireworks/models/kimi-k3",
-      "accounts/fireworks/models/qwen3p8-max"
+      "accounts/fireworks/models/gpt-oss-120b",
+      "accounts/fireworks/models/qwen3p8-max",
+      "accounts/fireworks/models/glm-5p3"
     ]
   },
   "capabilities": {
@@ -143,12 +142,12 @@
   },
   "evidence": {
     "rosterVerified": {
-      "date": "2026-08-30",
+      "date": "2026-09-28",
       "method": "GET /models against the live account, cross-checked with a real chat call per id"
     },
     "liveMatrix": {
-      "date": "2026-08-30",
-      "result": "The previous default, deepseek-v4-pro, is the reason a roster listing is never sufficient evidence here: it is still listed but a real chat call hangs past 120s, so the default moved to kimi-k2p6 (200 OK). Six ids return 404 'not deployed', including all three old vision models. Vision did not disappear with them: re-tested with a valid 64x64 PNG, kimi-k2p6, kimi-k3 and qwen3p8-max all describe the image correctly, while glm-5p3 answers 'does not support image inputs'. gpt-oss-20b is listed but 404s and was therefore not added."
+      "date": "2026-09-28",
+      "result": "Issue #1796: check:models reported the default, kimi-k2p6, as dead. Confirmed live — GET /models still lists it, but POST /chat/completions 404s 'Model not found, inaccessible, and/or not deployed', the same still-listed-but-unservable pattern deepseek-v4-pro hit in 2026-08. Moved the default to kimi-k3, the same Moonshot family's newest generation: 200 OK on a 1-token call, and a full-length call returns a proper OpenAI-shaped tool_calls entry with finish_reason=tool_calls, confirming tool support survives the swap. kimi-k2p6 marked retired rather than deleted, per the frozen-enum rule. gpt-oss-120b, qwen3p8-max and glm-5p3 (the rest of fallbacks/topModels) were re-probed alive at the same time."
     },
     "addedInPR": "https://github.com/juspay/neurolink/pull/1587"
   }

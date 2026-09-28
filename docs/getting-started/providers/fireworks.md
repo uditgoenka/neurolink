@@ -20,7 +20,7 @@ NeuroLink talks to the OpenAI-compatible endpoint at `api.fireworks.ai`.
 
 - **Protocol**: OpenAI-compatible (`/inference/v1/chat/completions`)
 - **Default base URL**: `https://api.fireworks.ai/inference/v1`
-- **Default model**: `accounts/fireworks/models/llama-v3p3-70b-instruct`
+- **Default model**: `accounts/fireworks/models/kimi-k3`
 - **Streaming**: Yes
 - **Tool calling**: Yes (model-dependent)
 
@@ -36,7 +36,7 @@ NeuroLink talks to the OpenAI-compatible endpoint at `api.fireworks.ai`.
 
 ```bash
 FIREWORKS_API_KEY=fw_your-key
-FIREWORKS_MODEL=accounts/fireworks/models/llama-v3p3-70b-instruct
+FIREWORKS_MODEL=accounts/fireworks/models/kimi-k3
 ```
 
 ### 3. Generate
@@ -57,7 +57,7 @@ console.log(result.content);
 
 | Model ID                                             | Notes     |
 | ---------------------------------------------------- | --------- |
-| `accounts/fireworks/models/llama-v3p3-70b-instruct`  | Default   |
+| `accounts/fireworks/models/kimi-k3`                  | Default   |
 | `accounts/fireworks/models/llama-v3p1-405b-instruct` | Flagship  |
 | `accounts/fireworks/models/deepseek-r1`              | Reasoning |
 | `accounts/fireworks/models/mixtral-8x22b-instruct`   | MoE       |
@@ -85,11 +85,11 @@ pnpm run cli generate "..." --provider fireworks --model accounts/fireworks/mode
 
 ## Configuration Reference
 
-| Environment Variable | Required | Default                                             |
-| -------------------- | -------- | --------------------------------------------------- |
-| `FIREWORKS_API_KEY`  | Yes      | —                                                   |
-| `FIREWORKS_MODEL`    | No       | `accounts/fireworks/models/llama-v3p3-70b-instruct` |
-| `FIREWORKS_BASE_URL` | No       | `https://api.fireworks.ai/inference/v1`             |
+| Environment Variable | Required | Default                                 |
+| -------------------- | -------- | --------------------------------------- |
+| `FIREWORKS_API_KEY`  | Yes      | —                                       |
+| `FIREWORKS_MODEL`    | No       | `accounts/fireworks/models/kimi-k3`     |
+| `FIREWORKS_BASE_URL` | No       | `https://api.fireworks.ai/inference/v1` |
 
 ---
 
