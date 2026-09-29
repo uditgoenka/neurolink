@@ -187,6 +187,25 @@ jobs:
           SCALEWAY_API_KEY: ${{ secrets.SCALEWAY_API_KEY }}
           CRUSOE_API_KEY: ${{ secrets.CRUSOE_API_KEY }}
           WANDB_INFERENCE_API_KEY: ${{ secrets.WANDB_INFERENCE_API_KEY }}
+          INCEPTRON_API_KEY: ${{ secrets.INCEPTRON_API_KEY }}
+          BYTEPLUS_MODELARK_API_KEY: ${{ secrets.BYTEPLUS_MODELARK_API_KEY }}
+          GRADIENTAI_API_KEY: ${{ secrets.GRADIENTAI_API_KEY }}
+          PARASAIL_API_KEY: ${{ secrets.PARASAIL_API_KEY }}
+          BAIDU_QIANFAN_API_KEY: ${{ secrets.BAIDU_QIANFAN_API_KEY }}
+          ARCEE_API_KEY: ${{ secrets.ARCEE_API_KEY }}
+          TELNYX_API_KEY: ${{ secrets.TELNYX_API_KEY }}
+          REKA_API_KEY: ${{ secrets.REKA_API_KEY }}
+          THINKING_MACHINES_API_KEY: ${{ secrets.THINKING_MACHINES_API_KEY }}
+          DASHSCOPE_API_KEY: ${{ secrets.DASHSCOPE_API_KEY }}
+          VISPARK_API_KEY: ${{ secrets.VISPARK_API_KEY }}
+          SAKANA_AI_API_KEY: ${{ secrets.SAKANA_AI_API_KEY }}
+          POOLSIDE_API_KEY: ${{ secrets.POOLSIDE_API_KEY }}
+          LEMONFOX_AI_API_KEY: ${{ secrets.LEMONFOX_AI_API_KEY }}
+          MODELSCOPE_API_KEY: ${{ secrets.MODELSCOPE_API_KEY }}
+          HETZNER_INFERENCE_API_KEY: ${{ secrets.HETZNER_INFERENCE_API_KEY }}
+          META_MODEL_API_API_KEY: ${{ secrets.META_MODEL_API_API_KEY }}
+          STACKIT_API_KEY: ${{ secrets.STACKIT_API_KEY }}
+          BYTEZ_API_KEY: ${{ secrets.BYTEZ_API_KEY }}
           VOYAGE_API_KEY: ${{ secrets.VOYAGE_API_KEY }}
           JINA_API_KEY: ${{ secrets.JINA_API_KEY }}
           STABILITY_API_KEY: ${{ secrets.STABILITY_API_KEY }}
